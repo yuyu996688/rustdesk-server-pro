@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # RustDesk Server Pro Docker 交互式部署脚本
-# 参考: https://rustdesk.com/docs/en/self-host/rustdesk-server-pro/
-# 部署方式: Docker (Pro 版) | 操作: 安装 / 卸载 / 启动 / 停止 / 重启 / 更新
+# 参考: https://rustdesk.com/docs/en/
+# 部署方式: Docker (Pro 版) | 安装范围: 仅 hbbs / 仅 hbbr / 两者都安装
+# 操作: 安装 / 卸载 / 启动 / 停止 / 重启 / 更新
 
 set -e
 
@@ -30,6 +31,38 @@ check_docker() {
         red "Docker 未运行或无权限，请使用 sudo 或加入 docker 组"
         exit 1
     fi
+}
+
+# 根据安装时选择的范围返回要操作的 compose 服务列表（空表示两者）
+get_compose_services() {
+    local dir="${1:-}"
+    local mode
+    if [[ -z "$dir" || ! -f "$dir/.install_mode" ]]; then
+        echo ""
+        return
+    fi
+    mode=$(sudo cat "$dir/.install_mode" 2>/dev/null)
+    case "$mode" in
+        hbbs) echo "hbbs" ;;
+        hbbr) echo "hbbr" ;;
+        *) echo "" ;;
+    esac
+}
+
+# 返回当前安装范围的描述（用于提示）
+get_install_mode_label() {
+    local dir="${1:-}"
+    local mode
+    if [[ -z "$dir" || ! -f "$dir/.install_mode" ]]; then
+        echo "两者 (hbbs + hbbr)"
+        return
+    fi
+    mode=$(sudo cat "$dir/.install_mode" 2>/dev/null)
+    case "$mode" in
+        hbbs) echo "仅 hbbs" ;;
+        hbbr) echo "仅 hbbr" ;;
+        *) echo "两者 (hbbs + hbbr)" ;;
+    esac
 }
 
 # 修改下载的 pro.yml：./data -> /conf/rustdesk/，去掉 network_mode: host，并添加端口映射
@@ -98,21 +131,22 @@ do_install() {
     fi
 
     echo ""
-    read -rp "是否从本地 tar 镜像加载? 若选 n 则从网络 pull [y/N]: " use_tar
-    use_tar=${use_tar:-N}
+    echo "安装范围 (hbbs=中继/信令, hbbr=中继转发):"
+    echo "  1) 仅 hbbs"
+    echo "  2) 仅 hbbr"
+    echo "  3) 两者都安装"
+    read -rp "请选择 [1-3，默认 3]: " install_scope
+    install_scope=${install_scope:-3}
+    case "$install_scope" in
+        1) INSTALL_MODE="hbbs" ;;
+        2) INSTALL_MODE="hbbr" ;;
+        3) INSTALL_MODE="both" ;;
+        *) red "无效选项"; exit 1 ;;
+    esac
+    echo "$INSTALL_MODE" | sudo tee "$INSTALL_DIR/.install_mode" >/dev/null
 
-    if [[ "${use_tar,,}" == "y" ]]; then
-        read -rp "请输入 tar 镜像文件路径 (如: rustdesk-server-pro.tar): " tar_path
-        if [[ -z "$tar_path" || ! -f "$tar_path" ]]; then
-            red "文件不存在: $tar_path"
-            exit 1
-        fi
-        yellow "正在加载镜像: $tar_path"
-        sudo docker load -i "$tar_path"
-    else
-        yellow "正在拉取镜像: $IMAGE_NAME"
-        sudo docker pull "$IMAGE_NAME"
-    fi
+    yellow "正在拉取镜像: $IMAGE_NAME"
+    sudo docker pull "$IMAGE_NAME"
 
     yellow "正在下载 compose 配置: rustdesk.com/pro.yml"
     ( cd "$INSTALL_DIR" && sudo wget -q "https://rustdesk.com/pro.yml" -O "$COMPOSE_FILE" ) || {
@@ -129,9 +163,26 @@ do_install() {
     fi
 
     yellow "正在启动容器..."
-    ( cd "$INSTALL_DIR" && sudo docker compose up -d )
-    green "安装完成。Web 控制台: http://<服务器IP>:21114 （默认账号 admin/test1234）"
-    green "请开放防火墙端口: TCP 21114-21119, UDP 21116"
+    COMPOSE_SERVICES=$(get_compose_services "$INSTALL_DIR")
+    if [[ -n "$COMPOSE_SERVICES" ]]; then
+        ( cd "$INSTALL_DIR" && sudo docker compose up -d $COMPOSE_SERVICES )
+    else
+        ( cd "$INSTALL_DIR" && sudo docker compose up -d )
+    fi
+    green "安装完成 (当前: $(get_install_mode_label "$INSTALL_DIR"))。"
+    case "$INSTALL_MODE" in
+        hbbs)
+            green "Web 控制台: http://<服务器IP>:21114 （默认账号 admin/test1234）"
+            green "请开放防火墙端口: TCP 21114-21116、21118, UDP 21116"
+            ;;
+        hbbr)
+            green "请开放防火墙端口: TCP 21117、21119"
+            ;;
+        *)
+            green "Web 控制台: http://<服务器IP>:21114 （默认账号 admin/test1234）"
+            green "请开放防火墙端口: TCP 21114-21119, UDP 21116"
+            ;;
+    esac
 }
 
 # 卸载
@@ -145,14 +196,24 @@ do_uninstall() {
         exit 1
     fi
 
-    yellow "正在停止并删除容器..."
-    ( cd "$INSTALL_DIR" && sudo docker compose down )
+    INSTALL_LABEL=$(get_install_mode_label "$INSTALL_DIR")
+    yellow "正在停止并删除容器 (当前安装: $INSTALL_LABEL)..."
+    COMPOSE_SERVICES=$(get_compose_services "$INSTALL_DIR")
+    if [[ -n "$COMPOSE_SERVICES" ]]; then
+        ( cd "$INSTALL_DIR" && sudo docker compose stop $COMPOSE_SERVICES )
+        for s in $COMPOSE_SERVICES; do
+            cid=$(cd "$INSTALL_DIR" && sudo docker compose ps -q $s 2>/dev/null)
+            [[ -n "$cid" ]] && echo "$cid" | xargs sudo docker rm -f 2>/dev/null || true
+        done
+    else
+        ( cd "$INSTALL_DIR" && sudo docker compose down )
+    fi
 
-    read -rp "是否删除数据目录 $INSTALL_DIR? [y/N]: " del_data
+    read -rp "是否删除安装目录 $INSTALL_DIR? [y/N]: " del_data
     del_data=${del_data:-N}
     if [[ "${del_data,,}" == "y" ]]; then
         sudo rm -rf "$INSTALL_DIR"
-        green "已删除 $INSTALL_DIR"
+        green "已删除 $INSTALL_DIR（含 .install_mode）"
     fi
 
     read -rp "是否删除本地镜像 $IMAGE_NAME? [y/N]: " del_image
@@ -175,7 +236,13 @@ do_start() {
         red "未发现 $INSTALL_DIR/$COMPOSE_FILE，请先执行安装"
         exit 1
     fi
-    ( cd "$INSTALL_DIR" && sudo docker compose up -d )
+    yellow "当前安装范围: $(get_install_mode_label "$INSTALL_DIR")"
+    COMPOSE_SERVICES=$(get_compose_services "$INSTALL_DIR")
+    if [[ -n "$COMPOSE_SERVICES" ]]; then
+        ( cd "$INSTALL_DIR" && sudo docker compose up -d $COMPOSE_SERVICES )
+    else
+        ( cd "$INSTALL_DIR" && sudo docker compose up -d )
+    fi
     green "已启动"
 }
 
@@ -189,7 +256,13 @@ do_stop() {
         red "未发现 $INSTALL_DIR/$COMPOSE_FILE"
         exit 1
     fi
-    ( cd "$INSTALL_DIR" && sudo docker compose stop )
+    yellow "当前安装范围: $(get_install_mode_label "$INSTALL_DIR")"
+    COMPOSE_SERVICES=$(get_compose_services "$INSTALL_DIR")
+    if [[ -n "$COMPOSE_SERVICES" ]]; then
+        ( cd "$INSTALL_DIR" && sudo docker compose stop $COMPOSE_SERVICES )
+    else
+        ( cd "$INSTALL_DIR" && sudo docker compose stop )
+    fi
     green "已停止"
 }
 
@@ -203,7 +276,13 @@ do_restart() {
         red "未发现 $INSTALL_DIR/$COMPOSE_FILE，请先执行安装"
         exit 1
     fi
-    ( cd "$INSTALL_DIR" && sudo docker compose restart )
+    yellow "当前安装范围: $(get_install_mode_label "$INSTALL_DIR")"
+    COMPOSE_SERVICES=$(get_compose_services "$INSTALL_DIR")
+    if [[ -n "$COMPOSE_SERVICES" ]]; then
+        ( cd "$INSTALL_DIR" && sudo docker compose restart $COMPOSE_SERVICES )
+    else
+        ( cd "$INSTALL_DIR" && sudo docker compose restart )
+    fi
     green "已重启"
 }
 
@@ -217,24 +296,12 @@ do_update() {
         red "未发现 $INSTALL_DIR/$COMPOSE_FILE，请先执行安装"
         exit 1
     fi
+    yellow "当前安装范围: $(get_install_mode_label "$INSTALL_DIR")"
+
+    yellow "正在拉取最新镜像: $IMAGE_NAME"
+    sudo docker pull "$IMAGE_NAME"
 
     echo ""
-    read -rp "是否从本地 tar 镜像加载? 若选 n 则从网络 pull 最新镜像 [y/N]: " use_tar
-    use_tar=${use_tar:-N}
-
-    if [[ "${use_tar,,}" == "y" ]]; then
-        read -rp "请输入 tar 镜像文件路径 (如: rustdesk-server-pro.tar): " tar_path
-        if [[ -z "$tar_path" || ! -f "$tar_path" ]]; then
-            red "文件不存在: $tar_path"
-            exit 1
-        fi
-        yellow "正在加载镜像: $tar_path"
-        sudo docker load -i "$tar_path"
-    else
-        yellow "正在拉取最新镜像: $IMAGE_NAME"
-        sudo docker pull "$IMAGE_NAME"
-    fi
-
     read -rp "是否重新下载并应用 compose 配置 (pro.yml)? [y/N]: " redownload_compose
     redownload_compose=${redownload_compose:-N}
     if [[ "${redownload_compose,,}" == "y" ]]; then
@@ -248,7 +315,12 @@ do_update() {
     fi
 
     yellow "正在使用新镜像重建并启动容器..."
-    ( cd "$INSTALL_DIR" && sudo docker compose up -d --force-recreate )
+    COMPOSE_SERVICES=$(get_compose_services "$INSTALL_DIR")
+    if [[ -n "$COMPOSE_SERVICES" ]]; then
+        ( cd "$INSTALL_DIR" && sudo docker compose up -d --force-recreate $COMPOSE_SERVICES )
+    else
+        ( cd "$INSTALL_DIR" && sudo docker compose up -d --force-recreate )
+    fi
     green "更新完成"
 }
 
